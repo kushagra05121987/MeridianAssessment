@@ -1,0 +1,22 @@
+# Build output
+target/
+
+# IDE
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+
+# Secrets — never commit
+secrets/
+*.pem
+*.key
+tasks.db
+
+# Local data files
+out/
+__pycache__/
+
+# OS
+.DS_Store
