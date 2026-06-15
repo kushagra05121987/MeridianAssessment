@@ -276,7 +276,7 @@ with `exchangeToMono` captures both status code and body regardless of HTTP stat
 
 ### Abandoned: Python scripting for Layer 3 search
 
-Wrote a Python script (`/tmp/layer3_search.py`) to brute-force Layer 3 by submitting
+Wrote a Python script (`layer3_search.py`) to brute-force Layer 3 by submitting
 candidate words from a 150,000-word English dictionary with various encoding strategies
 (strides, field orderings, modular arithmetic). Ran through 200+ candidates before
 concluding the answer is not a common English word derivable from the obvious encodings,
