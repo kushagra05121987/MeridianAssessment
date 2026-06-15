@@ -1,226 +1,136 @@
 # SE Assessment — Kushagra Mishra
 
-Spring Boot CLI for the four-layer API puzzle. Spring Boot is used only for DI /
-config / lifecycle — no web server, nothing authenticated runs on startup.
+This repo contains my solution to the four-layer API puzzle. I used Java (Spring Boot) as the
+main language since it gave me free DI, config, and lifecycle management without much boilerplate.
+The app runs entirely as a CLI — no web server, nothing authenticated happens on startup.
+
+---
+
+## How I approached it
+
+My first move was to read the health endpoint and the error envelope to understand what types
+the submission endpoint accepts, then figure out the pagination shape before touching any
+authenticated call. Once I knew what I was dealing with I started the clock and went layer by layer.
+
+The biggest early gotcha was pagination: the `total` field in the response grows as you make
+authenticated requests (each call appends a usage record), so a naive loop comparing
+`fetched < total` never terminates cleanly. The fix is to snapshot `totalPages` from page 1
+and iterate exactly that many pages regardless of what `total` says later.
+
+---
+
+## Project layout
+
+```
+src/main/java/com/assessment/
+├── Runner.java                  — CLI entry point, one case per command
+├── algorithm/
+│   └── QueryEngine.java         — O(N+K) index-based query engine
+├── client/
+│   ├── AssessmentClient.java    — all HTTP logic (429 retry, bulk token, rate-limit logging)
+│   └── Submission.java          — submission DTO
+├── config/
+│   └── AssessmentProperties.java
+└── util/
+    ├── Crypto.java              — RSA-PKCS1v15 decrypt + AES helpers
+    └── Hashing.java             — SHA-256 / MD5
+
+challenges/
+├── algorithm/                   — algorithm challenge (solved)
+│   ├── solver.py                — standalone Python solver (reference implementation)
+│   ├── README.md
+│   ├── RATIONALE.md             — benchmark numbers and design decisions
+│   └── tests/test_solver.py
+├── design/README.md             — not attempted
+└── ui/README.md                 — not attempted
+```
 
 ---
 
 ## Setup
 
 ```bash
-# Build once before starting the clock
+# Build before starting the clock so the first authed call doesn't wait on a compile
 /path/to/mvn -q package -DskipTests
-```
 
-### Environment
-
-```bash
 export ASSESSMENT_BASEURL=https://ca-seassessment-api-dev.happywater-190f264d.northcentralus.azurecontainerapps.io
-export ASSESSMENT_APIKEY=sa_...          # never committed — load from secrets/
+export ASSESSMENT_APIKEY=sa_...   # keep this out of git — load from env or secrets/
 ```
 
 ---
 
-## Commands
+## Solving the layers — step by step
 
+### Layer 1 — content hash
+
+Layer 1 asks you to prove you can fetch the whole dataset and verify byte-level integrity.
+
+**What to do:**
+1. Paginate through `GET /api/v1/dataset?page=N` until you've pulled all seed records.
+   Snapshot `total_pages = ceil(total / page_size)` from page 1 — don't re-read `total` per
+   page or it'll grow underneath you.
+2. Base64-decode each record's ciphertext and concatenate all the raw bytes in page order.
+3. SHA-256 the concatenated bytes.
+4. Submit: `{ "type": "content_hash", "value": "<64-char hex>" }`
+
+**Run it:**
 ```bash
-MVN=/path/to/mvn
-
-# Unauthenticated — does NOT start the clock
-$MVN spring-boot:run -Dspring-boot.run.arguments="health"
-
-# Layer 1 + 2 together (recommended — single page-fetch snapshot)
-$MVN spring-boot:run -Dspring-boot.run.arguments="solve-layers-full secrets/private_key.pem"
-
-# Layer 1 only
-$MVN spring-boot:run -Dspring-boot.run.arguments="solve-layer1"
-
-# Layer 2 only
-$MVN spring-boot:run -Dspring-boot.run.arguments="solve-layer2 secrets/private_key.pem"
-
-# Algorithm challenge
-$MVN spring-boot:run -Dspring-boot.run.arguments="solve-algorithm"
-
-# Free-form analysis (Layer 4)
-$MVN spring-boot:run -Dspring-boot.run.arguments="layer4 'your analysis here'"
-
-# Submit repo URL (do this last)
-$MVN spring-boot:run -Dspring-boot.run.arguments="submit repo https://github.com/kushagra05121987/MeridianAssessment"
+mvn spring-boot:run -Dspring-boot.run.arguments="solve-layer1"
 ```
 
 ---
 
-## Architecture
+### Layer 2 — decrypted hash
 
+Same idea as Layer 1 but you RSA-decrypt each record first before hashing.
+
+**What to do:**
+1. Fetch all pages (same snapshot strategy as Layer 1).
+2. For each ciphertext: base64-decode → RSA-2048 PKCS#1v1.5 decrypt using the platform-issued
+   private key → concatenate the plaintext bytes.
+3. SHA-256 the concatenated plaintext.
+4. Submit: `{ "type": "decrypted_hash", "value": "<64-char hex>" }`
+
+A few things I got wrong first:
+- The platform key is PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`), not a raw RSA key.
+  Java's `KeyFactory` needs `PKCS8EncodedKeySpec` — using `RSAPrivateKeySpec` directly fails.
+- The cipher is `RSA/ECB/PKCS1Padding`. I initially tried AES-GCM and AES-CBC before realising
+  it was asymmetric.
+
+**Run it (does Layer 1 + 2 in a single page fetch — recommended):**
+```bash
+mvn spring-boot:run \
+  -Dspring-boot.run.arguments="solve-layers-full secrets/private_key.pem"
 ```
-src/main/java/com/assessment/
-├── Runner.java                    — CLI command dispatcher (thin layer)
-├── algorithm/
-│   └── QueryEngine.java           — O(N+K) query engine for the algorithm challenge
-├── client/
-│   ├── AssessmentClient.java      — HTTP wrapper (WebClient, 429 retry, rate-limit logging)
-│   └── Submission.java            — submission DTO
-├── config/
-│   └── AssessmentProperties.java  — @ConfigurationProperties binding
-└── util/
-    ├── Crypto.java                 — RSA-PKCS1v15 decrypt, AES-GCM/CBC helpers
-    └── Hashing.java                — SHA-256, MD5 hex helpers
+
+---
+
+### Layer 3 — hidden alphabetic string
+
+The clue: *"You can find a short answer hidden across the decrypted records. The shape of the
+answer is alphabetic."*
+
+I spent significant time on this one. The dataset has 500 seed records, each a JSON object with
+7 fields: `endpoint`, `latency_ms`, `method`, `request_bytes`, `status_code`, `timestamp`,
+`user_segment`. I tried every encoding I could think of — see the full log below. Everything
+I submitted came back as `layer: 4`, which is what the API returns for any analysis answer that
+isn't the exact Layer 3 match.
+
+**Status: not solved.**
+
+---
+
+### Layer 4 — free-form analysis
+
+Submit anything interesting about the data as `{ "type": "analysis", "value": "..." }`.
+The API accepts any analysis answer that isn't the Layer 3 match and records it as Layer 4.
+Multiple submissions are allowed.
+
+**Run it:**
+```bash
+mvn spring-boot:run \
+  -Dspring-boot.run.arguments="layer4 'your observation here'"
 ```
-
-### Architecture choices and tradeoffs
-
-**Spring Boot as a CLI shell, not a server**
-
-Spring Boot was chosen for DI, config binding (`@ConfigurationProperties`), and lifecycle
-management — not for its web stack. `spring.main.web-application-type=none` keeps startup
-fast and prevents any accidental port binding. The tradeoff is a heavier dependency footprint
-than a plain Java main; the upside is that config, logging, and DI come for free without
-wiring any of it manually.
-
-**WebClient over RestTemplate / HttpClient**
-
-WebClient (reactive) was used even though no reactive pipeline is needed, because it gives
-the cleanest fluent API for exchangeToMono with access to both status code and body in one
-step — important for capturing 4xx bodies instead of throwing. RestTemplate would throw on
-non-2xx. Plain HttpClient would require more boilerplate. Tradeoff: pulls in the full
-Reactor/Netty stack; acceptable since Spring WebFlux is already a common dependency.
-
-**Snapshot pagination strategy**
-
-The dataset is live — new usage records are appended as API calls are made. A naive
-"keep fetching until records_so_far == total" loop would never converge because `total`
-grows with each authenticated request.
-
-Fix: read `total` from page 1 once, compute `totalPages = ceil(total / page_size)` as a
-snapshot, then fetch exactly that many pages. Any records generated during the fetch land
-beyond the snapshot window and are excluded. This gives a stable, reproducible hash even
-under concurrent writes.
-
-**Thin Runner / fat Client / pure Util split**
-
-- `Runner.java` is intentionally thin: parse args, call client methods, log results.
-  No business logic.
-- `AssessmentClient.java` owns all HTTP concerns: retry, rate-limit logging, 429 backoff,
-  bulk token lifecycle.
-- `Crypto` and `Hashing` are pure static utilities with no external dependencies.
-- `QueryEngine` is a standalone POJO — no Spring annotations — so it can be unit-tested
-  without a Spring context.
-
-This separation means each concern can be changed independently and tested in isolation.
-
-**Secret management**
-
-API key and private key never touch git. The API key is injected via environment variable
-(`ASSESSMENT_APIKEY`); the private key is passed as a file path argument and lives in
-`secrets/` which is gitignored. No secrets in `application.properties`, no secrets in
-commit history.
-
----
-
-## Layer outcomes
-
-| Layer | Type             | Status    | Notes                                                |
-|-------|------------------|-----------|------------------------------------------------------|
-| 1     | `content_hash`   | Solved    | SHA-256 of concatenated raw (encrypted) record bytes |
-| 2     | `decrypted_hash` | Solved    | SHA-256 of RSA-PKCS1v15 decrypted plaintext bytes    |
-| 3     | `analysis`       | Attempted | Hidden alphabetic string — not found (see log below) |
-| 4     | `analysis`       | Solved    | Free-form analysis accepted                          |
-
----
-
-## Layer 3 — full investigation log
-
-The clue: *"You can find a short answer hidden across the decrypted records. The shape of
-the answer is alphabetic."*
-
-The dataset has 500 seed records (Jan–Mar 2026). Each decrypted record is a JSON object
-with 7 fields: `endpoint`, `latency_ms`, `method`, `request_bytes`, `status_code`,
-`timestamp`, `user_segment`. There are 10 distinct endpoints, 10 user segments, 7 methods,
-12 status codes.
-
-Every approach below returned `layer: 4` from the server.
-
-### Approach 1 — acrostics on field values
-
-Took the first (and last) letter of `user_segment`, `endpoint`, and `method` for each
-record in multiple orderings:
-- Natural page order (page 1 record 0 → page 20 record 499)
-- Chronological timestamp order
-- Strides 2, 3, 4, … 125 (every N-th record)
-- Sorted by latency, request_bytes, status_code
-
-Found real English words at stride 4 on `user_segment` first letters ("first", "swim",
-"rise", "sire") but all returned layer 4. Concluded the server checks an exact string,
-not whether the submission is a valid word.
-
-### Approach 2 — numeric field → letter mapping
-
-Mapped numeric fields modulo 26 to `a–z`:
-
-- `latency_ms % 26` for each record in order
-- `request_bytes % 26` for each record in order
-- `status_code % 26` for each record in order
-- Only records where `latency_ms` falls in ASCII letter range 65–122:
-  6 such records → values 119, 65, 80, 71, 97, 71 → "wAPGaG" — not a word
-
-### Approach 3 — field-value count encoding
-
-Counted occurrences of each unique field value across all 500 records, then mapped those
-counts to letters using various offsets and modulo operations.
-
-Endpoint counts (ascending): login(38), users(42), orders(45), webhooks(48), search(49),
-notifications(51), analytics(52), products(54), refresh(60), billing(61).
-
-First letters in count order: l, u, o, w, s, n, a, p, r, b — tried all anagram subsets
-that form English words (loans, prowls, sprawl, upwards, …). None matched.
-
-Tried count-offset mapping: `count - min_count → letter index` → spelled fragments like
-"aehlnoqwx". No recognisable word.
-
-Status code third-digit encoding: 4xx codes (400, 401, 403, 404, 429) have third digits
-0, 1, 3, 4, 9 → skipping 0 → a, c, d, i → "acid". Submitted "acid" — layer 4.
-
-### Approach 4 — raw RSA padding inspection
-
-Loaded the raw ciphertext bytes and computed `pow(c, d, n)` (raw modular exponentiation,
-no unpadding) to inspect the PKCS#1v1.5 padding bytes directly. The 0x00 0x02 … 0x00
-structure was intact with random-looking padding bytes. No hidden message in the padding.
-
-### Approach 5 — description text as the answer
-
-The hint "layer 3 is in 3" suggested the answer might be a word literally present in the
-Layer 3 description. Submitted every word from the clue text: short, answer, hidden,
-across, decrypted, records, shape, alphabetic, find, layer, prove, match, correct, digest,
-analysis. All returned layer 4.
-
-### Approach 6 — field name inspection
-
-Tried the field names themselves as the answer: endpoint, latency, method, request, status,
-timestamp, segment, records. Also tried acronyms (ELMRTSU from the first letters of the 7
-field names). All layer 4.
-
-### Approach 7 — per-page and per-window searches
-
-Looked for words within each 25-record page window independently (first letters of
-`user_segment` on page 1, page 2, etc.). No consistent word emerged across pages.
-
-### Remaining hypothesis
-
-The encoding is likely a low-entropy steganographic scheme (e.g. a specific sequence of
-records selected by a non-obvious criterion — perhaps the first record of each unique
-`(endpoint, user_segment)` pair in insertion order, or records where `status_code` equals
-`request_bytes % 1000`). Without knowing the specific rule, exhaustive search of all
-plausible short alphabetic strings is impractical.
-
----
-
-## Optional challenges
-
-| Challenge | Status   | Location                |
-|-----------|----------|-------------------------|
-| Algorithm | Solved   | `challenges/algorithm/` |
-| Design    | See dir  | `challenges/design/`    |
-| UI        | See dir  | `challenges/ui/`        |
 
 ---
 
@@ -228,81 +138,168 @@ plausible short alphabetic strings is impractical.
 
 ```bash
 /path/to/mvn test
-# 17 tests: 4 in UtilTest, 13 in QueryEngineTest — all pass
 ```
+
+17 tests across two suites, all passing:
+- `UtilTest` (4 tests) — SHA-256 and RSA round-trip checks
+- `QueryEngineTest` (13 tests) — unit tests for all three query types using a 12-record
+  hand-crafted dataset, no network required
+
+---
+
+## Optional challenges
+
+The platform offers three optional challenges beyond the four layers. Evidence of completion
+goes under `challenges/<name>/`.
+
+| Challenge  | Status        | Notes                                              |
+|------------|---------------|----------------------------------------------------|
+| Algorithm  | **Solved**    | Hash submitted and verified correct by the server  |
+| Design     | Not attempted | Brief available at `/api/v1/challenges/design`     |
+| UI         | Not attempted | Brief available at `/api/v1/challenges/ui`         |
+
+### Algorithm challenge
+
+Build a query engine over 50,000 records that answers 10,000 queries fast enough that a
+naive O(N×K) scan would time out.
+
+**How I solved it:**
+
+The single-record endpoint (`/api/v1/dataset/jumbo/{seq}`) is rate-limited and would take
+~14 hours for 50,000 records — clearly the wrong path. The `OPTIONS /api/v1/dataset/jumbo`
+response documented a bulk-download flow:
+
+1. `POST /api/v1/dataset/jumbo/bulk-request` → get a 60-second single-use token
+2. `GET /api/v1/dataset/jumbo/bulk/{token}` → full 50k-record JSON in one shot (~10 MB),
+   no `Authorization` header needed — the token itself is the credential
+
+Once I had the records I built three indices in a single O(N) pass:
+- **HashMap** `(user_segment, status_code) → count` for `count` queries
+- **HashSet** of `(endpoint, method, status_code, user_segment)` tuples for `exists` queries
+- **Sorted int[]** + binary search for `range_count` queries on `latency_ms` and `request_bytes`
+
+Results on my machine:
+- Preprocessing 40 ms, 10k queries 7 ms, 0.7 µs per query average
+- Server confirmed: `{ "correct": true }`
+
+See `challenges/algorithm/RATIONALE.md` for benchmark details and the design tradeoffs.
+
+---
+
+## Architecture decisions
+
+**Spring Boot as a CLI, not a server**
+
+I used Spring Boot purely for DI and config — `spring.main.web-application-type=none` keeps
+startup fast and prevents accidental port binding. The tradeoff is a heavier dependency
+footprint than a plain `main()`, but getting `@ConfigurationProperties`, structured logging,
+and DI for free was worth it in an assessment context.
+
+**WebClient instead of RestTemplate**
+
+RestTemplate throws an exception on 4xx responses, which swallows the error body. The first
+time I hit a 400, I couldn't read the `valid_types` list that would have saved me time.
+Switched to WebClient with `exchangeToMono` — it gives access to the status code and body
+regardless of HTTP status, and also handles 429 retries cleanly.
+
+**Thin Runner / fat Client split**
+
+`Runner.java` only parses CLI args and calls client methods. All HTTP concerns — retries, rate-
+limit header logging, 429 backoff, bulk token lifecycle — live in `AssessmentClient`. Util
+classes (`Crypto`, `Hashing`) are pure static methods with no Spring dependencies, so they can
+be unit tested without starting a context.
+
+**Secret handling**
+
+API key goes in an env var (`ASSESSMENT_APIKEY`). Private key is passed as a file path arg
+and lives in `secrets/` which is gitignored. Neither ever touches `application.properties`
+or commit history.
+
+---
+
+## Layer 3 — full investigation log
+
+I tried everything I could think of. All submissions returned `layer: 4`.
+
+**Acrostics on field values**
+
+Took the first (and sometimes last) letter of `user_segment`, `endpoint`, and `method` for
+every record in different orderings: natural page order, chronological timestamp order,
+strides 2 through 125 (every Nth record). Found real English words like "first", "swim",
+"rise" at stride 4 on `user_segment` first letters — but all returned layer 4.
+
+**Numeric field → letter**
+
+Mapped `latency_ms % 26`, `request_bytes % 26`, and `status_code % 26` to `a–z` for each
+record. Also filtered to only records where `latency_ms` falls in the ASCII letter range
+(65–122) — 6 records → values 119, 65, 80, 71, 97, 71 → "wAPGaG". Not a word.
+
+**Field-value count encoding**
+
+Counted occurrences of each unique endpoint and user_segment across all 500 records, then
+tried mapping those counts to letters with various offsets. Endpoint counts in ascending
+order give first letters l, u, o, w, s, n, a, p, r, b — no clean word emerges as an
+anagram or substring.
+
+Also tried the 4xx status code last-digit trick: 401→a, 403→c, 404→d, 429→i → "acid".
+Thematically elegant (ACID = database properties), but wrong.
+
+**Raw RSA padding bytes**
+
+Used Python to compute `pow(ciphertext, d, n)` without unpadding to inspect the PKCS#1v1.5
+structure directly. The padding bytes (0x00 0x02 ... 0x00) looked genuinely random — no
+hidden message there.
+
+**Description text as the answer**
+
+The hint "layer 3 is in 3" made me wonder if the answer was a word from the clue itself.
+Submitted every word in the Layer 3 description: short, answer, hidden, across, decrypted,
+records, shape, alphabetic, find, layer, prove, match, correct, digest. All layer 4.
+
+**Field names**
+
+Tried the field names themselves: endpoint, latency, method, request, status, timestamp,
+segment. Also tried the acronym from all seven first letters (ELMRSTU). All layer 4.
+
+**Filtered subsets**
+
+Filtered records by method (only GET records, only POST records, etc.) and by status code,
+then read first letters of `user_segment` or `endpoint` in timestamp order. Nothing.
+
+Tried: most common `user_segment` per page, first record of each day, first record of each
+unique status code, and records sorted by `(status_code, timestamp)`. All layer 4.
+
+**Record boundaries**
+
+Searched the concatenated JSON for English words that span across record boundaries. The
+only alphabetic strings at boundaries were fragments: "egment", "gment", "ment" — all tails
+of "user_segment".
 
 ---
 
 ## Scratch work and abandoned approaches
 
-### Abandoned: single-record fetching for the jumbo dataset
+**Pagination loop that never converged**
 
-Initial instinct for the algorithm challenge was to paginate the jumbo dataset the same
-way as the main dataset. Checked the rate limit (5 req/window) and the record count
-(50,000). At 1 req/s that's ~14 hours — infeasible. Checked the API docs via
-`OPTIONS /api/v1/dataset/jumbo` which documented the bulk-download token flow. Switched
-to that immediately.
+My first attempt looped while `fetched_so_far < total`. Each page fetch added a usage record,
+so `total` kept growing by 1. The loop never exited cleanly and produced a different record
+count each run. Snapshotting `totalPages` from page 1 fixed it.
 
-### Abandoned: AES decryption for Layer 2
+**AES decryption for Layer 2**
 
-Before receiving the private key, assumed Layer 2 might use AES-GCM or AES-CBC (common
-symmetric schemes). Added `Crypto.aesGcmPrefixedNonce` and `Crypto.aesCbcPrefixedIv`
-helpers and tried both on the first record's ciphertext. Both failed to decrypt (wrong
-algorithm). The platform-issued key turned out to be an RSA-2048 private key in PKCS#8
-PEM format, and the cipher was `RSA/ECB/PKCS1Padding`. The AES helpers remain in
-`Crypto.java` as they are referenced in the design challenge spec.
+Before I knew the key was RSA, I assumed AES-GCM or AES-CBC since those are the most common
+symmetric schemes. Added `aesGcmPrefixedNonce` and `aesCbcPrefixedIv` helpers and tried both.
+Both threw `BadPaddingException`. Once I saw the key was 2048-bit and the brief mentioned RSA,
+that was the end of that.
 
-### Abandoned: live-total pagination loop
+**Single-record fetching for the jumbo dataset**
 
-First pagination implementation: `while (fetched < total) { fetch next page; }`.
-This silently diverged because each authenticated request added a usage record, growing
-`total`. The loop never terminated cleanly and produced a different record count each run,
-giving an unstable hash. Fixed by snapshotting `totalPages` from the page 1 response and
-iterating exactly that many pages regardless of how `total` changes mid-fetch.
+I initially thought about paginating the jumbo dataset the same way as the main dataset. Then
+I did the arithmetic: 50,000 records at 5 req/reset-window = a very long time. `OPTIONS` on
+the jumbo endpoint documented the bulk-download token approach — two requests total instead of
+10,000.
 
-### Abandoned: PKCS#1 key spec for RSA loading
+**RestTemplate**
 
-First attempt at loading the RSA private key used `RSAPrivateCrtKeySpec` built from
-manually parsing the ASN.1 DER structure. This failed because the platform-issued key
-is PKCS#8-wrapped, not a raw RSA key. Switched to `PKCS8EncodedKeySpec` which works
-directly with `KeyFactory.getInstance("RSA").generatePrivate(...)`.
-
-### Abandoned: RestTemplate for HTTP
-
-Initially scaffolded the HTTP client with `RestTemplate` because it is simpler. Switched
-to `WebClient` after the first 4xx response threw an exception and swallowed the error
-body — impossible to read the `valid_types` list in the 400 error envelope. `WebClient`
-with `exchangeToMono` captures both status code and body regardless of HTTP status.
-
-### Abandoned: Python scripting for Layer 3 search
-
-Wrote a Python script (`layer3_search.py`) to brute-force Layer 3 by submitting
-candidate words from a 150,000-word English dictionary with various encoding strategies
-(strides, field orderings, modular arithmetic). Ran through 200+ candidates before
-concluding the answer is not a common English word derivable from the obvious encodings,
-or requires a non-obvious selection rule not visible in the data surface.
-
----
-
-## Notes / scratch
-
-**Pagination snapshot fix:** the live `total` field grows as authenticated calls are made
-during pagination. Snapshotting `totalPages` from page 1 is the only way to get a
-deterministic record count and a stable hash.
-
-**RSA key format:** the platform issues PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`).
-Java's `KeyFactory` needs `PKCS8EncodedKeySpec`. Using `RSAPrivateKeySpec` directly fails
-with an `InvalidKeySpecException`.
-
-**Rate limiting:** 5 requests per reset window. The 429 body contains `retry_after` in
-seconds. `AssessmentClient.fetchPageWithRetry` reads this value and sleeps accordingly
-before retrying — avoids burning the entire budget on a burst that hits the wall.
-
-**Submission idempotency:** the API records every submission attempt, even duplicates.
-Correct submissions are accepted multiple times (useful for re-running), but each attempt
-is logged server-side. Kept submissions minimal to avoid polluting the record.
-
-**Algorithm challenge bulk flow:** single-record endpoint is rate-limited and infeasible
-for 50,000 records at ~14 hours. Correct path:
-1. `POST /api/v1/dataset/jumbo/bulk-request` → 60-second single-use token (1 rate-limit token)
-2. `GET /api/v1/dataset/jumbo/bulk/{token}` → full 50k-record JSON, ~10 MB, no auth header
+Started scaffolding with `RestTemplate` because it is simpler. Switched to `WebClient` after
+the first 4xx response threw an exception and I couldn't read the error body. Lesson noted.
