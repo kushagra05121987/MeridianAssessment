@@ -100,6 +100,35 @@ public class AssessmentClient {
                 .block();
     }
 
+    /**
+     * Mint a single-use 60-second bulk-download token for the jumbo dataset,
+     * then immediately redeem it (token is the credential — no auth header on bulk GET).
+     * Returns the raw JSON string of the 50,000-record envelope.
+     */
+    public String getJumboBulk() {
+        // Mint token (costs 1 rate-limit token)
+        String mintResp = postAuthed("/api/v1/dataset/jumbo/bulk-request", java.util.Map.of());
+        // Extract token value
+        try {
+            com.fasterxml.jackson.databind.JsonNode node =
+                    new com.fasterxml.jackson.databind.ObjectMapper().readTree(
+                            mintResp.substring(mintResp.indexOf(' ') + 1));
+            String token = node.path("token").asText();
+            log.info("Bulk token minted: {}", token);
+            // Redeem — no Authorization header, token IS the credential
+            String bulkUrl = props.getBaseUrl() + "/api/v1/dataset/jumbo/bulk/" + token;
+            org.springframework.web.reactive.function.client.WebClient noAuth =
+                    rawBuilder.baseUrl(props.getBaseUrl()).build();
+            return noAuth.get()
+                    .uri("/api/v1/dataset/jumbo/bulk/" + token)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to mint/redeem jumbo bulk token", e);
+        }
+    }
+
     /** Generic authed GET returning String, capturing 4xx body too. */
     public String getAuthedRaw(String path) {
         return web.get()

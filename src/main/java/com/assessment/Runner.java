@@ -1,9 +1,13 @@
 package com.assessment;
 
+import com.assessment.algorithm.QueryEngine;
 import com.assessment.client.AssessmentClient;
 import com.assessment.client.Submission;
 import com.assessment.util.Crypto;
 import com.assessment.util.Hashing;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.ApplicationArguments;
@@ -11,11 +15,15 @@ import org.springframework.boot.ApplicationRunner;
 import org.springframework.stereotype.Component;
 
 import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.PrivateKey;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Command dispatcher. Nothing here touches an authed endpoint unless you pass
@@ -148,6 +156,56 @@ public class Runner implements ApplicationRunner {
                 log.info("Layer 2 response: {}", r2);
             }
 
+            // ── Algorithm challenge ───────────────────────────────────────────
+            case "solve-algorithm" -> {
+                ObjectMapper mapper = new ObjectMapper();
+                try {
+                log.info("Downloading 50,000-record jumbo dataset via bulk endpoint...");
+                long t0 = System.currentTimeMillis();
+                String bulkJson = client.getJumboBulk();
+                JsonNode bulkRoot = mapper.readTree(bulkJson);
+                List<Map<String, Object>> records = mapper.convertValue(
+                        bulkRoot.path("records"),
+                        new TypeReference<List<Map<String, Object>>>() {});
+                log.info("Downloaded {} records in {}ms", records.size(), System.currentTimeMillis() - t0);
+
+                log.info("Fetching 10,000-query batch...");
+                String queryResp = client.getAuthed("/api/v1/challenges/algorithm/queries");
+                JsonNode queryRoot = mapper.readTree(queryResp.substring(queryResp.indexOf(' ') + 1));
+                List<Map<String, Object>> queries = mapper.convertValue(
+                        queryRoot.path("queries"),
+                        new TypeReference<List<Map<String, Object>>>() {});
+                log.info("Fetched {} queries", queries.size());
+
+                log.info("Building indices...");
+                long t1 = System.currentTimeMillis();
+                QueryEngine engine = new QueryEngine(records);
+                log.info("Preprocessing done in {}ms", System.currentTimeMillis() - t1);
+
+                log.info("Answering queries...");
+                long t2 = System.currentTimeMillis();
+                List<Integer> answers = new ArrayList<>(queries.size());
+                for (Map<String, Object> q : queries) answers.add(engine.answer(q));
+                long queryMs = System.currentTimeMillis() - t2;
+                log.info("Answered {} queries in {}ms ({} µs avg)",
+                        queries.size(), queryMs, queryMs * 1000 / queries.size());
+
+                String payload = answers.stream().map(Object::toString).collect(Collectors.joining(","));
+                String digest = Hashing.sha256Hex(payload.getBytes(StandardCharsets.UTF_8));
+                log.info("Digest: {}", digest);
+
+                String notes = String.format(
+                        "Preprocessing %dms | %d queries %dms | %d µs avg. " +
+                        "HashMap for count, HashSet for exists, sorted int[]+binary-search for range_count.",
+                        System.currentTimeMillis() - t1, queries.size(), queryMs, queryMs * 1000 / queries.size());
+                String resp = client.postAuthed("/api/v1/submit",
+                        Submission.of("algorithm_answer", digest, notes));
+                log.info("Submit response: {}", resp);
+                } catch (Exception e) {
+                    throw new RuntimeException("solve-algorithm failed", e);
+                }
+            }
+
             // ── Layer 4: free-form analysis ───────────────────────────────────
             case "layer4" -> {
                 require(positionals.size() >= 2, "layer4 needs <analysis-text>");
@@ -218,6 +276,7 @@ public class Runner implements ApplicationRunner {
                   solve-layer2 <private-key.pem>
                   solve-layers-full <private-key.pem>     ← fetch + submit L1 & L2 together
                   layer4 <analysis-text>
+                  solve-algorithm                         ← algorithm challenge (jumbo dataset)
                 """);
     }
 }
